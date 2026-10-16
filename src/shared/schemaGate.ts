@@ -15,7 +15,7 @@ export interface SchemaGateResult {
   error?: string;
 }
 
-export function validateAgentPlanSchema(raw: unknown): SchemaGateResult {
+export function validateAgentPlanSchema(raw: unknown, maxSteps: number = 9): SchemaGateResult {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     return { valid: false, error: 'AgentPlan must be a non-null JSON object.' };
   }
@@ -38,10 +38,10 @@ export function validateAgentPlanSchema(raw: unknown): SchemaGateResult {
     return { valid: false, error: 'AgentPlan.actions must be an array.' };
   }
 
-  if (obj.actions.length < 1 || obj.actions.length > 9) {
+  if (obj.actions.length < 1 || obj.actions.length > maxSteps) {
     return {
       valid: false,
-      error: `AgentPlan.actions length must be between 1 and 9 (received ${obj.actions.length}).`,
+      error: `AgentPlan.actions length must be between 1 and ${maxSteps} (received ${obj.actions.length}).`,
     };
   }
 

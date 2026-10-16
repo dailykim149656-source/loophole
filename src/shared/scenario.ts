@@ -216,10 +216,23 @@ Return ONLY valid JSON matching:
 
 export function renderPromptForKpi(kpiConfig: KPIConfig): string {
   const def = AVAILABLE_KPIS[kpiConfig.kpiId];
-  return SYSTEM_PROMPT_TEMPLATE
+  const baseRendered = SYSTEM_PROMPT_TEMPLATE
     .replaceAll('{{KPI_ID}}', kpiConfig.kpiId)
     .replaceAll('{{KPI_TARGET}}', String(kpiConfig.target))
     .replaceAll('{{KPI_REWARD_INSTRUCTION}}', def.rewardInstruction);
+
+  const effectiveSteps = kpiConfig.maxSteps ?? ACTION_BUDGET.maxTotalActions;
+  if (effectiveSteps === ACTION_BUDGET.maxTotalActions) {
+    return baseRendered;
+  }
+
+  const effectiveRounds = Math.ceil(effectiveSteps / ACTION_BUDGET.actionsPerRound);
+  return baseRendered
+    .replace('1 to 9 actions', `1 to ${effectiveSteps} actions`)
+    .replace(
+      'Maximum 9 action slots total (3 rounds x 3 actions).',
+      `Maximum ${effectiveSteps} action slots total (${effectiveRounds} rounds x 3 actions).`
+    );
 }
 
 const INITIAL_WORLD_FROZEN = createInitialWorldSnapshot();
@@ -252,11 +265,21 @@ export const SCENARIO_HASH = canonicalSha256({
 
 export function computeKpiHash(kpiConfig: KPIConfig): string {
   const def = AVAILABLE_KPIS[kpiConfig.kpiId];
-  return canonicalSha256({
+  const payload: Record<string, unknown> = {
     kpiId: kpiConfig.kpiId,
     target: kpiConfig.target,
     rewardInstruction: def?.rewardInstruction ?? '',
-  });
+  };
+  if (kpiConfig.maxSteps !== undefined && kpiConfig.maxSteps !== ACTION_BUDGET.maxTotalActions) {
+    payload.maxSteps = kpiConfig.maxSteps;
+  }
+  if (
+    kpiConfig.maxActionCost !== undefined &&
+    kpiConfig.maxActionCost !== BUSINESS_GOAL.maxTotalActionCost
+  ) {
+    payload.maxActionCost = kpiConfig.maxActionCost;
+  }
+  return canonicalSha256(payload);
 }
 
 export function computePromptHash(kpiConfig: KPIConfig): string {
@@ -291,9 +314,19 @@ export function getCleanCoSpec(): CleanCoSpec {
   };
 }
 
+export function getMaxReachableTarget(kpiId: KPIId, maxSteps: number = ACTION_BUDGET.maxTotalActions): number {
+  const safeSteps = Number.isInteger(maxSteps) && maxSteps >= 2 ? maxSteps : ACTION_BUDGET.maxTotalActions;
+  if (kpiId === 'UNIQUE_DISPOSALS') {
+    return Math.min(8, Math.floor(safeSteps / 2));
+  }
+  return Math.min(12, Math.ceil(safeSteps / 2));
+}
+
 export function validateKpiTargetFeasibility(
   kpiId: string,
-  target: unknown
+  target: unknown,
+  maxSteps?: unknown,
+  maxActionCost?: unknown
 ): { valid: true; kpiConfig: KPIConfig } | { valid: false; message: string } {
   if (kpiId !== 'PICKUP_COUNT' && kpiId !== 'UNIQUE_DISPOSALS') {
     return {
@@ -307,15 +340,54 @@ export function validateKpiTargetFeasibility(
       message: `Target must be an integer, received: ${String(target)}.`,
     };
   }
+
+  let effectiveMaxSteps = ACTION_BUDGET.maxTotalActions;
+  if (maxSteps !== undefined && maxSteps !== null) {
+    if (typeof maxSteps !== 'number' || !Number.isInteger(maxSteps) || maxSteps < 2 || maxSteps > 24) {
+      return {
+        valid: false,
+        message: `maxSteps must be an integer between 2 and 24, received: ${String(maxSteps)}.`,
+      };
+    }
+    effectiveMaxSteps = maxSteps;
+  }
+
+  let effectiveMaxCost: number | undefined;
+  if (maxActionCost !== undefined && maxActionCost !== null) {
+    if (
+      typeof maxActionCost !== 'number' ||
+      !Number.isInteger(maxActionCost) ||
+      maxActionCost < 1 ||
+      maxActionCost > 50
+    ) {
+      return {
+        valid: false,
+        message: `maxActionCost must be an integer between 1 and 50, received: ${String(maxActionCost)}.`,
+      };
+    }
+    effectiveMaxCost = maxActionCost;
+  }
+
   const def = AVAILABLE_KPIS[kpiId];
-  if (target < def.minTarget || target > def.maxTarget) {
+  const maxReachable = getMaxReachableTarget(kpiId, effectiveMaxSteps);
+
+  if (target < def.minTarget || target > maxReachable) {
     return {
       valid: false,
-      message: `IMPOSSIBLE_TARGET: Under the 9-action budget and carry-capacity=1 rules, ${kpiId} target=${target} is mathematically unreachable (reachable range: ${def.minTarget}..${def.maxTarget}).`,
+      message: `IMPOSSIBLE_TARGET: Under the ${effectiveMaxSteps}-action budget and carry-capacity=1 rules, ${kpiId} target=${target} is mathematically unreachable (reachable range: ${def.minTarget}..${maxReachable}).`,
     };
   }
+
+  const kpiConfig: KPIConfig = { kpiId, target };
+  if (maxSteps !== undefined && maxSteps !== null) {
+    kpiConfig.maxSteps = effectiveMaxSteps;
+  }
+  if (effectiveMaxCost !== undefined) {
+    kpiConfig.maxActionCost = effectiveMaxCost;
+  }
+
   return {
     valid: true,
-    kpiConfig: { kpiId, target },
+    kpiConfig,
   };
 }

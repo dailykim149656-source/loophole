@@ -61,6 +61,20 @@ export const VerifiedOutcomesCard: React.FC<OutcomeChartsProps> = ({
   const costA = runA.inspector.totalActionCost;
   const costB = runB?.inspector.totalActionCost ?? 0;
 
+  const costLimitA =
+    runA.kpiConfig.maxActionCost ??
+    ((runA.kpiConfig.maxSteps ?? 9) > 9
+      ? Math.max(10, Math.ceil((runA.kpiConfig.maxSteps ?? 9) * 1.5))
+      : 10);
+  const costLimitB = runB
+    ? runB.kpiConfig.maxActionCost ??
+      ((runB.kpiConfig.maxSteps ?? 9) > 9
+        ? Math.max(10, Math.ceil((runB.kpiConfig.maxSteps ?? 9) * 1.5))
+        : 10)
+    : 10;
+  const effectiveCostLimit = Math.max(costLimitA, costLimitB);
+  const costMaxScale = Math.max(14, costA + 2, costB + 2, effectiveCostLimit + 4);
+
   const deltaDisposals = dispB - dispA;
   const deltaRemaining = remA - remB;
   const deltaCost = costB - costA;
@@ -100,7 +114,7 @@ export const VerifiedOutcomesCard: React.FC<OutcomeChartsProps> = ({
       subtitle: 'cost units · lower is better',
       valA: costA,
       valB: runB ? costB : null,
-      maxScale: 14,
+      maxScale: costMaxScale,
       showLimitLine: true,
     },
   ];
@@ -146,7 +160,9 @@ export const VerifiedOutcomesCard: React.FC<OutcomeChartsProps> = ({
                 )
               : 3;
 
-          const limitBottomPx = Math.round((10 / card.maxScale) * maxBarPx);
+          const limitBottomPx = Math.round(
+            (effectiveCostLimit / card.maxScale) * maxBarPx
+          );
 
           return (
             <div
@@ -173,10 +189,10 @@ export const VerifiedOutcomesCard: React.FC<OutcomeChartsProps> = ({
                     <div
                       className="absolute left-0 right-0 border-t border-dashed border-slate-600/70 pointer-events-none flex justify-end"
                       style={{ bottom: `${limitBottomPx}px` }}
-                      title="Business Goal Cost Guardrail (<= 10)"
+                      title={`Business Goal Cost Guardrail (<= ${effectiveCostLimit})`}
                     >
                       <span className="text-[9px] font-mono text-slate-400 -mt-3.5 bg-[#0F172A]/90 px-1 rounded">
-                        &lt;= 10 limit
+                        &lt;= {effectiveCostLimit} limit
                       </span>
                     </div>
                   )}
@@ -335,7 +351,7 @@ export const StepwiseWasteChartCard: React.FC<OutcomeChartsProps> = ({
   const isCanonicalWindow = maxStepA === 7 && (maxStepB === 6 || maxStepB === 0);
   const displayMaxStep = isCanonicalWindow
     ? 6
-    : Math.max(maxStepB > 0 ? maxStepB : maxStepA, 6);
+    : Math.max(maxStepA, maxStepB, 6);
 
   const plottedA = seriesA.filter((p) => p.step <= displayMaxStep);
   const plottedB = seriesB.filter((p) => p.step <= displayMaxStep);

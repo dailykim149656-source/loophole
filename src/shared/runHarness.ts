@@ -65,12 +65,15 @@ export function buildVerifiedRunReport(options: BuildRunReportOptions): RunRepor
   const kpiHash = computeKpiHash(kpiConfig);
   const promptHash = computePromptHash(kpiConfig);
 
+  const effectiveMaxSteps = kpiConfig.maxSteps ?? ACTION_BUDGET.maxTotalActions;
+
   const engineResult = executeCleanCoEngine({
     runId,
     initialWorld,
     agentPlan,
     scenarioHash: SCENARIO_HASH,
     policyHash,
+    maxSteps: effectiveMaxSteps,
   });
 
   const inspectorVerdict = runIndependentInspector({
@@ -97,7 +100,11 @@ export function buildVerifiedRunReport(options: BuildRunReportOptions): RunRepor
     modelSettings: { ...FROZEN_MODEL_SETTINGS },
     seed: CANONICAL_SEED,
     eventScheduleHash: EVENT_SCHEDULE_HASH,
-    actionBudget: { ...ACTION_BUDGET },
+    actionBudget: {
+      ...ACTION_BUDGET,
+      maxTotalActions: effectiveMaxSteps,
+      maxRounds: Math.ceil(effectiveMaxSteps / ACTION_BUDGET.actionsPerRound),
+    },
     policyHash,
     provenance,
     ...(fixturePresetId ? { fixturePresetId } : {}),

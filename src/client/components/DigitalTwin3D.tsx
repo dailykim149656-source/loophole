@@ -14,6 +14,8 @@ export interface DigitalTwin3DProps {
   onWebGLFailure: (reason: string) => void;
   snapSignal: number;
   activeExperimentLabel?: string;
+  hideUiOverlays?: boolean;
+  disableInteraction?: boolean;
 }
 
 const TILE_SPACING = 2.15;
@@ -219,6 +221,84 @@ function createWasteBadgeTexture(
   return texture;
 }
 
+function createTrajectoryStepBadgeTexture(
+  step: number,
+  action: string,
+  decision: string
+): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = 220;
+  canvas.height = 68;
+  const ctx = canvas.getContext('2d')!;
+
+  ctx.clearRect(0, 0, 220, 68);
+
+  const isBlock = decision === 'BLOCK';
+  const borderColor = isBlock
+    ? '#EF4444'
+    : action === 'DROP'
+    ? '#F97316'
+    : action === 'DISPOSE'
+    ? '#10B981'
+    : '#F87171';
+
+  const label = isBlock
+    ? `S${step} · BLOCK`
+    : action === 'DROP'
+    ? `S${step} · LOOP DROP`
+    : `S${step} · LOOP`;
+
+  ctx.fillStyle = '#0F172A';
+  ctx.beginPath();
+  ctx.roundRect(6, 8, 208, 52, 14);
+  ctx.fill();
+
+  ctx.lineWidth = 3.5;
+  ctx.strokeStyle = borderColor;
+  ctx.stroke();
+
+  ctx.fillStyle = borderColor;
+  ctx.beginPath();
+  ctx.arc(28, 34, 6.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#F8FAFC';
+  ctx.font = '700 21px "JetBrains Mono", monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, 44, 35);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function disposeGroupChildren(group: THREE.Group): void {
+  while (group.children.length > 0) {
+    const child = group.children[0];
+    group.remove(child);
+    child.traverse((obj) => {
+      const maybeMesh = obj as THREE.Mesh | THREE.Sprite | THREE.LineSegments;
+      if ('geometry' in maybeMesh && maybeMesh.geometry) {
+        maybeMesh.geometry.dispose();
+      }
+      if ('material' in maybeMesh && maybeMesh.material) {
+        const mats = Array.isArray(maybeMesh.material)
+          ? maybeMesh.material
+          : [maybeMesh.material];
+        for (const mat of mats) {
+          const matWithMap = mat as THREE.Material & { map?: THREE.Texture | null };
+          if (matWithMap.map) {
+            matWithMap.map.dispose();
+          }
+          mat.dispose();
+        }
+      }
+    });
+  }
+}
+
 interface WasteVisualNode {
   group: THREE.Group;
   bagMesh: THREE.Mesh;
@@ -240,13 +320,19 @@ export const DigitalTwin3D: React.FC<DigitalTwin3DProps> = ({
   onWebGLFailure,
   snapSignal,
   activeExperimentLabel,
+  hideUiOverlays = false,
+  disableInteraction = false,
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const [hoveredWasteId, setHoveredWasteId] = useState<WasteId | null>(null);
+  const [showTrail, setShowTrail] = useState<boolean>(true);
 
   // Refs for mutable access inside requestAnimationFrame & event handlers
   const projectedRef = useRef<ProjectedFrameState>(projected);
   projectedRef.current = projected;
+
+  const showTrailRef = useRef<boolean>(showTrail);
+  showTrailRef.current = showTrail;
 
   const selectedWasteRef = useRef<WasteId | null>(selectedWasteId);
   selectedWasteRef.current = selectedWasteId;
@@ -316,7 +402,7 @@ export const DigitalTwin3D: React.FC<DigitalTwin3DProps> = ({
     const scene = new THREE.Scene();
     scene.background = new THREE.Color('#0B101B');
 
-    const frustumSize = 11.8;
+    const frustumSize = hideUiOverlays ? 8.6 : 11.8;
     const aspect = width / height;
     const camera = new THREE.OrthographicCamera(
       (-frustumSize * aspect) / 2,
@@ -328,14 +414,19 @@ export const DigitalTwin3D: React.FC<DigitalTwin3DProps> = ({
     );
 
     const defaultCamPos = new THREE.Vector3(12.2, 12.8, 12.2);
-    const defaultTarget = new THREE.Vector3(0.35, 0.15, 0.45);
+    const defaultTarget = hideUiOverlays
+      ? new THREE.Vector3(0.45, 0.25, 0.35)
+      : new THREE.Vector3(0.35, 0.15, 0.45);
     camera.position.copy(defaultCamPos);
     camera.lookAt(defaultTarget);
 
     const controls = new MapControls(camera, renderer.domElement);
+    controls.enabled = !disableInteraction;
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
-    controls.enableRotate = true;
+    controls.enableRotate = !disableInteraction;
+    controls.enableZoom = !disableInteraction;
+    controls.enablePan = !disableInteraction;
     controls.minZoom = 0.65;
     controls.maxZoom = 2.4;
     controls.maxPolarAngle = Math.PI / 2.5;
@@ -946,11 +1037,38 @@ export const DigitalTwin3D: React.FC<DigitalTwin3DProps> = ({
     blockBeaconGroup.add(blockBeamMesh);
     scene.add(blockBeaconGroup);
 
-    // 10b. Dynamic 3D Trajectory Path Group on the Plaza Floor (Coral #FF6B6B for Run A, Mint #20D997 for Run B)
+    // 10b. Procedural 3D Trajectory Path Trail Group (C-3: y = 0.09 above plaza tiles)
     const trajectoryGroup = new THREE.Group();
-    trajectoryGroup.position.y = 0.095;
+    trajectoryGroup.position.y = 0.09;
     scene.add(trajectoryGroup);
     let lastTrajectoryKey = '';
+
+    // 10c. Procedural 3D Action Burst FX Group (C-3: expanding shockwave / rising energy rings)
+    const actionFxGroup = new THREE.Group();
+    actionFxGroup.visible = false;
+
+    const fxPrimaryTorusGeo = new THREE.TorusGeometry(0.56, 0.04, 12, 36);
+    fxPrimaryTorusGeo.rotateX(Math.PI / 2);
+    const fxPrimaryTorusMat = new THREE.MeshBasicMaterial({
+      color: '#38BDF8',
+      transparent: true,
+      opacity: 0.85,
+    });
+    const fxPrimaryTorus = new THREE.Mesh(fxPrimaryTorusGeo, fxPrimaryTorusMat);
+    actionFxGroup.add(fxPrimaryTorus);
+
+    const fxSecondaryRingGeo = new THREE.RingGeometry(0.48, 0.64, 36);
+    fxSecondaryRingGeo.rotateX(-Math.PI / 2);
+    const fxSecondaryRingMat = new THREE.MeshBasicMaterial({
+      color: '#38BDF8',
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.65,
+    });
+    const fxSecondaryRing = new THREE.Mesh(fxSecondaryRingGeo, fxSecondaryRingMat);
+    actionFxGroup.add(fxSecondaryRing);
+
+    scene.add(actionFxGroup);
 
     // 11. 8 Stylized Trash Bags / Canisters (W01..W08) + Ghost Origin Wireframes
     const wasteNodes = new Map<WasteId, WasteVisualNode>();
@@ -1131,9 +1249,13 @@ export const DigitalTwin3D: React.FC<DigitalTwin3DProps> = ({
       renderer.domElement.style.cursor = hitWasteId ? 'pointer' : 'grab';
     };
 
-    renderer.domElement.addEventListener('pointerdown', handlePointerDown);
-    renderer.domElement.addEventListener('pointerup', handlePointerUp);
-    renderer.domElement.addEventListener('pointermove', handlePointerMove);
+    if (!disableInteraction) {
+      renderer.domElement.addEventListener('pointerdown', handlePointerDown);
+      renderer.domElement.addEventListener('pointerup', handlePointerUp);
+      renderer.domElement.addEventListener('pointermove', handlePointerMove);
+    } else {
+      renderer.domElement.style.cursor = 'default';
+    }
 
     // 13. Resize Observer
     const handleResize = () => {
@@ -1155,6 +1277,7 @@ export const DigitalTwin3D: React.FC<DigitalTwin3DProps> = ({
     // 14. Animation Loop (Pure projection of projectedRef.current)
     let animFrameId = 0;
     const clock = new THREE.Clock();
+    const upAxis = new THREE.Vector3(0, 1, 0);
 
     const animate = () => {
       animFrameId = requestAnimationFrame(animate);
@@ -1163,130 +1286,176 @@ export const DigitalTwin3D: React.FC<DigitalTwin3DProps> = ({
 
       const snap = projectedRef.current;
       const selWaste = selectedWasteRef.current;
+      const trailEnabled = showTrailRef.current;
       const immediate = shouldSnapRef.current;
       shouldSnapRef.current = false;
 
-      // Rebuild 3D Floor Trajectory Path Lines & Loop/Delivery Markers when frame or run changes
-      const runLabelHint =
-        activeExperimentLabelRef.current ??
-        (snap.runId.toLowerCase().includes('exp_b') ? 'RUN B' : 'RUN A');
-      const isRunB = runLabelHint.toUpperCase().includes('B');
-      const trajectoryKey = `${snap.runId}:${snap.frameIndex}:${isRunB ? 'B' : 'A'}`;
+      // C-3 (1): Rebuild Procedural 3D Trajectory Path Trail when frameIndex, runId, or showTrail changes
+      trajectoryGroup.visible = trailEnabled;
+      const trajectoryKey = `${snap.runId}:${snap.frameIndex}:${trailEnabled ? '1' : '0'}`;
 
       if (trajectoryKey !== lastTrajectoryKey) {
         lastTrajectoryKey = trajectoryKey;
-        while (trajectoryGroup.children.length > 0) {
-          const child = trajectoryGroup.children[0];
-          trajectoryGroup.remove(child);
-        }
+        disposeGroupChildren(trajectoryGroup);
 
-        const primaryColor = isRunB ? '#20D997' : '#FF6B6B';
-        const pairCounts = new Map<string, number>();
+        if (trailEnabled) {
+          const pairCounts = new Map<string, number>();
+          const sameTileCounts = new Map<string, number>();
 
-        for (let idx = 0; idx < snap.trajectoryHistory.length; idx++) {
-          const seg = snap.trajectoryHistory[idx];
-          const isLatest = idx === snap.trajectoryHistory.length - 1;
-          const segColor =
-            seg.decision === 'BLOCK' ? '#EF4444' : primaryColor;
-          const segOpacity = isLatest ? 0.92 : 0.58;
+          for (let idx = 0; idx < snap.trajectoryHistory.length; idx++) {
+            const seg = snap.trajectoryHistory[idx];
+            const isLatest = idx === snap.trajectoryHistory.length - 1;
 
-          const p1 = getLocationWorldPos(seg.fromLocation);
-          const p2 = getLocationWorldPos(seg.toLocation);
+            // Color coding per C-3 spec:
+            // BLOCK -> Crimson #EF4444
+            // DISPOSE -> Mint Emerald #10B981
+            // DROP -> Coral Amber #F97316 (highlights the loophole drop!)
+            // PICK_UP -> Electric Blue #38BDF8
+            let segColor = '#38BDF8';
+            if (seg.decision === 'BLOCK') {
+              segColor = '#EF4444';
+            } else if (seg.action === 'DISPOSE') {
+              segColor = '#10B981';
+            } else if (seg.action === 'DROP') {
+              segColor = '#F97316';
+            } else if (seg.action === 'PICK_UP') {
+              segColor = '#38BDF8';
+            }
 
-          if (p1.distanceTo(p2) < 0.05) {
-            // Same-tile action (e.g. PICK_UP followed by DROP on the same tile): draw a loop torus ring
-            const loopTorus = new THREE.Mesh(
-              new THREE.TorusGeometry(0.54, 0.045, 10, 28),
-              new THREE.MeshBasicMaterial({
+            const segOpacity = isLatest ? 0.95 : 0.68;
+            const startPos = getLocationWorldPos(seg.fromLocation);
+            const endPos = getLocationWorldPos(seg.toLocation);
+
+            if (startPos.distanceTo(endPos) <= 0.1) {
+              // Same-tile repeated action (e.g., PICK_UP + DROP on the same tile in Experiment A!):
+              // Render a prominent Loophole Orbit Ring (THREE.TorusGeometry(0.62, 0.045, 12, 32))
+              // in Coral/Amber (#F87171 or #EF4444 if BLOCK) around that tile with a small step badge
+              const locKey = seg.toLocation;
+              const loopIdx = sameTileCounts.get(locKey) ?? 0;
+              sameTileCounts.set(locKey, loopIdx + 1);
+
+              const orbitColor = seg.decision === 'BLOCK' ? '#EF4444' : '#F87171';
+              const loopTorus = new THREE.Mesh(
+                new THREE.TorusGeometry(0.62, 0.045, 12, 32),
+                new THREE.MeshBasicMaterial({
+                  color: orbitColor,
+                  transparent: true,
+                  opacity: isLatest ? 0.96 : 0.78,
+                })
+              );
+              loopTorus.rotation.x = Math.PI / 2;
+              loopTorus.position.set(endPos.x, 0.03 + loopIdx * 0.042, endPos.z);
+              trajectoryGroup.add(loopTorus);
+
+              // Small step badge showing the robot gaming the metric in place
+              const stepBadgeTex = createTrajectoryStepBadgeTexture(
+                seg.step,
+                seg.action,
+                seg.decision
+              );
+              const stepBadgeMat = new THREE.SpriteMaterial({
+                map: stepBadgeTex,
+                depthTest: false,
+                transparent: true,
+                opacity: isLatest ? 1.0 : 0.88,
+              });
+              const stepBadgeSprite = new THREE.Sprite(stepBadgeMat);
+              const angleOffset = (loopIdx % 4) * (Math.PI / 2) + Math.PI / 4;
+              stepBadgeSprite.position.set(
+                endPos.x + Math.cos(angleOffset) * 0.64,
+                0.34 + loopIdx * 0.14,
+                endPos.z + Math.sin(angleOffset) * 0.64
+              );
+              stepBadgeSprite.scale.set(1.18, 0.36, 1);
+              trajectoryGroup.add(stepBadgeSprite);
+            } else {
+              const pairKey = [seg.fromLocation, seg.toLocation].sort().join('::');
+              const seenCount = pairCounts.get(pairKey) ?? 0;
+              pairCounts.set(pairKey, seenCount + 1);
+
+              const dir = new THREE.Vector3().subVectors(endPos, startPos);
+              const dirNorm = dir.clone().normalize();
+              const perp = new THREE.Vector3(-dirNorm.z, 0, dirNorm.x);
+
+              // Offset repeated segments between the same two locations so forward & return paths are distinct
+              const lateralOffset =
+                seenCount === 0
+                  ? 0
+                  : (seenCount % 2 === 1 ? 1 : -1) *
+                    0.16 *
+                    Math.ceil(seenCount / 2);
+
+              const startPt = startPos
+                .clone()
+                .addScaledVector(perp, lateralOffset)
+                .addScaledVector(dirNorm, 0.26);
+              const endPt = endPos
+                .clone()
+                .addScaledVector(perp, lateralOffset)
+                .addScaledVector(dirNorm, -0.26);
+              const segVec = new THREE.Vector3().subVectors(endPt, startPt);
+              const segLen = Math.max(0.15, segVec.length());
+              const midPt = new THREE.Vector3()
+                .addVectors(startPt, endPt)
+                .multiplyScalar(0.5);
+
+              // Elevated glowing 3D arched curve (THREE.QuadraticBezierCurve3) + TubeGeometry
+              const arcHeight =
+                Math.min(0.38, Math.max(0.12, segLen * 0.1)) + seenCount * 0.05;
+              const curve = new THREE.QuadraticBezierCurve3(
+                new THREE.Vector3(startPt.x, 0.015, startPt.z),
+                new THREE.Vector3(midPt.x, arcHeight, midPt.z),
+                new THREE.Vector3(endPt.x, 0.015, endPt.z)
+              );
+
+              const tubeGeo = new THREE.TubeGeometry(
+                curve,
+                22,
+                isLatest ? 0.05 : 0.034,
+                8,
+                false
+              );
+              const tubeMat = new THREE.MeshBasicMaterial({
                 color: segColor,
                 transparent: true,
                 opacity: segOpacity,
-              })
-            );
-            loopTorus.rotation.x = Math.PI / 2;
-            loopTorus.position.set(p2.x, 0.025 + idx * 0.005, p2.z);
-            trajectoryGroup.add(loopTorus);
-          } else {
-            const pairKey = [seg.fromLocation, seg.toLocation].sort().join('::');
-            const seenCount = pairCounts.get(pairKey) ?? 0;
-            pairCounts.set(pairKey, seenCount + 1);
+              });
+              const tubeMesh = new THREE.Mesh(tubeGeo, tubeMat);
+              trajectoryGroup.add(tubeMesh);
 
-            const dir = new THREE.Vector3().subVectors(p2, p1);
-            const len = dir.length();
-            const dirNorm = dir.clone().normalize();
-            const perp = new THREE.Vector3(-dirNorm.z, 0, dirNorm.x);
+              // Directional cone arrowhead along the QuadraticBezierCurve3 tangent
+              const arrowT = 0.68;
+              const arrowPos = curve.getPoint(arrowT);
+              const arrowTangent = curve.getTangent(arrowT).normalize();
+              const coneGeo = new THREE.ConeGeometry(
+                isLatest ? 0.135 : 0.105,
+                0.28,
+                12
+              );
+              const coneMesh = new THREE.Mesh(
+                coneGeo,
+                new THREE.MeshBasicMaterial({
+                  color: segColor,
+                  transparent: true,
+                  opacity: Math.min(1, segOpacity + 0.12),
+                })
+              );
+              coneMesh.position.copy(arrowPos);
+              coneMesh.quaternion.setFromUnitVectors(upAxis, arrowTangent);
+              trajectoryGroup.add(coneMesh);
 
-            // Offset repeated segments between the same two locations so forward & return loop paths are both visible
-            const lateralOffset =
-              seenCount === 0
-                ? 0
-                : (seenCount % 2 === 1 ? 1 : -1) *
-                  0.16 *
-                  Math.ceil(seenCount / 2);
-
-            const startPt = p1
-              .clone()
-              .addScaledVector(perp, lateralOffset)
-              .addScaledVector(dirNorm, 0.28);
-            const endPt = p2
-              .clone()
-              .addScaledVector(perp, lateralOffset)
-              .addScaledVector(dirNorm, -0.28);
-            const segVec = new THREE.Vector3().subVectors(endPt, startPt);
-            const segLen = Math.max(0.15, segVec.length());
-            const midPt = new THREE.Vector3()
-              .addVectors(startPt, endPt)
-              .multiplyScalar(0.5);
-
-            // Glowing floor ribbon strip
-            const ribbonGeo = new THREE.BoxGeometry(
-              isLatest ? 0.13 : 0.09,
-              0.022,
-              segLen
-            );
-            const ribbonMat = new THREE.MeshBasicMaterial({
-              color: segColor,
-              transparent: true,
-              opacity: segOpacity,
-            });
-            const ribbonMesh = new THREE.Mesh(ribbonGeo, ribbonMat);
-            ribbonMesh.position.set(midPt.x, 0.015 + idx * 0.003, midPt.z);
-            ribbonMesh.rotation.y = Math.atan2(dirNorm.x, dirNorm.z);
-            trajectoryGroup.add(ribbonMesh);
-
-            // Directional arrowhead cone along the segment
-            const arrowPos = startPt
-              .clone()
-              .lerp(endPt, 0.76);
-            const coneGeo = new THREE.ConeGeometry(
-              isLatest ? 0.16 : 0.12,
-              0.32,
-              10
-            );
-            coneGeo.rotateX(Math.PI / 2);
-            const coneMesh = new THREE.Mesh(
-              coneGeo,
-              new THREE.MeshBasicMaterial({
-                color: segColor,
-                transparent: true,
-                opacity: Math.min(1, segOpacity + 0.1),
-              })
-            );
-            coneMesh.position.set(arrowPos.x, 0.03 + idx * 0.003, arrowPos.z);
-            coneMesh.rotation.y = Math.atan2(dirNorm.x, dirNorm.z);
-            trajectoryGroup.add(coneMesh);
-
-            // Waypoint node dot at destination
-            const dotMesh = new THREE.Mesh(
-              new THREE.CylinderGeometry(0.12, 0.12, 0.025, 14),
-              new THREE.MeshBasicMaterial({
-                color: segColor,
-                transparent: true,
-                opacity: segOpacity,
-              })
-            );
-            dotMesh.position.set(p2.x, 0.02, p2.z);
-            trajectoryGroup.add(dotMesh);
+              // Waypoint node dot at destination
+              const dotMesh = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.12, 0.12, 0.025, 14),
+                new THREE.MeshBasicMaterial({
+                  color: segColor,
+                  transparent: true,
+                  opacity: segOpacity,
+                })
+              );
+              dotMesh.position.set(endPos.x, 0.015, endPos.z);
+              trajectoryGroup.add(dotMesh);
+            }
           }
         }
       }
@@ -1354,6 +1523,75 @@ export const DigitalTwin3D: React.FC<DigitalTwin3DProps> = ({
         blockBeamMat.opacity = 0.22 + 0.15 * Math.sin(elapsed * 10);
       } else {
         blockBeaconGroup.visible = false;
+      }
+
+      // C-3 (2): Procedural 3D Action Burst FX (actionFxGroup)
+      if (!activeEv) {
+        actionFxGroup.visible = false;
+      } else {
+        actionFxGroup.visible = true;
+        const phase1 = (elapsed * 1.45) % 1;
+        const phase2 = (elapsed * 1.45 + 0.5) % 1;
+
+        if (activeEv.decision === 'BLOCK') {
+          // Pulsing double red shockwave ring (#EF4444) around the robot
+          actionFxGroup.position.set(workerGroup.position.x, 0, workerGroup.position.z);
+          fxPrimaryTorusMat.color.set('#EF4444');
+          fxSecondaryRingMat.color.set('#EF4444');
+
+          fxPrimaryTorus.position.y = 0.16 + phase1 * 0.22;
+          fxPrimaryTorus.scale.setScalar(0.65 + phase1 * 1.25);
+          fxPrimaryTorusMat.opacity = (1 - phase1) * 0.9;
+
+          fxSecondaryRing.position.y = 0.12 + phase2 * 0.18;
+          fxSecondaryRing.scale.setScalar(0.65 + phase2 * 1.35);
+          fxSecondaryRingMat.opacity = (1 - phase2) * 0.85;
+        } else if (activeEv.action === 'DISPOSE') {
+          // Rising emerald rings (#34D399) above DISPOSAL_BIN_POS
+          actionFxGroup.position.copy(DISPOSAL_BIN_POS);
+          fxPrimaryTorusMat.color.set('#34D399');
+          fxSecondaryRingMat.color.set('#10B981');
+
+          fxPrimaryTorus.position.y = 0.88 + phase1 * 1.25;
+          fxPrimaryTorus.scale.setScalar(0.75 + phase1 * 0.7);
+          fxPrimaryTorusMat.opacity = (1 - phase1) * 0.92;
+
+          fxSecondaryRing.position.y = 0.88 + phase2 * 1.25;
+          fxSecondaryRing.scale.setScalar(0.75 + phase2 * 0.75);
+          fxSecondaryRingMat.opacity = (1 - phase2) * 0.82;
+        } else if (activeEv.action === 'DROP') {
+          // Pulsing amber/coral ripple ring at the drop tile
+          const dropPos = snap.highlightedTileId
+            ? getTileWorldPos(snap.highlightedTileId)
+            : workerGroup.position;
+          actionFxGroup.position.set(dropPos.x, 0, dropPos.z);
+          fxPrimaryTorusMat.color.set('#F97316');
+          fxSecondaryRingMat.color.set('#F87171');
+
+          fxPrimaryTorus.position.y = 0.14 + phase1 * 0.16;
+          fxPrimaryTorus.scale.setScalar(0.55 + phase1 * 1.15);
+          fxPrimaryTorusMat.opacity = (1 - phase1) * 0.92;
+
+          fxSecondaryRing.position.y = 0.11;
+          fxSecondaryRing.scale.setScalar(0.55 + phase2 * 1.25);
+          fxSecondaryRingMat.opacity = (1 - phase2) * 0.78;
+        } else {
+          // PICK_UP: Pulsing cyan ring at the pickup tile
+          const pickPos = snap.highlightedTileId
+            ? getTileWorldPos(snap.highlightedTileId)
+            : workerGroup.position;
+          actionFxGroup.position.set(pickPos.x, 0, pickPos.z);
+          fxPrimaryTorusMat.color.set('#38BDF8');
+          fxSecondaryRingMat.color.set('#22D3EE');
+
+          fxPrimaryTorus.position.y = 0.14 + phase1 * 0.35;
+          fxPrimaryTorus.scale.setScalar(0.55 + phase1 * 0.95);
+          fxPrimaryTorusMat.opacity = (1 - phase1) * 0.88;
+
+          fxSecondaryRing.position.y = 0.11;
+          fxSecondaryRing.scale.setScalar(0.55 + phase2 * 1.05);
+          fxSecondaryRingMat.opacity = (1 - phase2) * 0.75;
+        }
       }
 
       // Update each Waste bag/canister from projected.wastes
@@ -1471,10 +1709,12 @@ export const DigitalTwin3D: React.FC<DigitalTwin3DProps> = ({
       renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
       renderer.domElement.removeEventListener('pointerup', handlePointerUp);
       renderer.domElement.removeEventListener('pointermove', handlePointerMove);
+      disposeGroupChildren(trajectoryGroup);
+      disposeGroupChildren(actionFxGroup);
       controls.dispose();
       renderer.dispose();
     };
-  }, [onWebGLFailure]);
+  }, [onWebGLFailure, hideUiOverlays, disableInteraction]);
 
   const activeEv = projected.activeEvent;
   const derivedRunLabel =
@@ -1488,243 +1728,264 @@ export const DigitalTwin3D: React.FC<DigitalTwin3DProps> = ({
     : null;
 
   return (
-    <div className="relative w-full h-full bg-[#0B101B] overflow-hidden select-none">
+    <div
+      className={`relative w-full h-full bg-[#0B101B] overflow-hidden select-none ${
+        disableInteraction ? 'pointer-events-none' : ''
+      }`}
+    >
       {/* Three.js WebGL 2 Mount Container */}
       <div
         ref={mountRef}
-        className="w-full h-full"
+        className={`w-full h-full ${disableInteraction ? 'pointer-events-none' : ''}`}
         data-testid="digital-twin-3d-canvas"
       />
 
-      {/* Top-Left Compact Telemetry & Camera Reset Pill (Opaque — ZERO backdrop-filter per §2.3) */}
-      <div className="absolute top-3 left-3 z-10 flex items-center gap-2 bg-[#0F172A] border border-slate-800 rounded-lg px-2.5 py-1.5 shadow-lg">
-        <span className="inline-block w-2 h-2 rounded-full bg-emerald-400" />
-        <div className="flex items-center gap-2.5 font-mono text-[11px]">
-          <span className="text-amber-400">
-            PUB <strong>{projected.world.publicCount}</strong>
-          </span>
-          <span className="text-cyan-400">
-            CARRY <strong>{projected.world.carriedCount}</strong>
-          </span>
-          <span className="text-emerald-400">
-            DISP <strong>{projected.world.disposedCount}</strong>/8
-          </span>
-        </div>
-        <button
-          type="button"
-          onClick={() => cameraResetRef.current?.()}
-          className="ml-1 px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 font-mono text-[10px] border border-slate-700 cursor-pointer"
-          title="Reset isometric camera view"
-        >
-          RESET CAM
-        </button>
-      </div>
-
-      {/* 3D Raycaster Object Forensics Popover Card (Concept 04 — Opaque, ZERO backdrop-filter) */}
-      {selectedWasteId && selectedForensics && selectedWasteState && (
-        <div
-          data-testid="object-forensics-popover"
-          className="absolute top-14 left-3 z-20 w-[238px] bg-[#0F172A] border border-cyan-500/70 rounded-xl p-3 shadow-2xl"
-        >
-          <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-800">
-            <div>
-              <div className="text-[9px] font-bold tracking-widest text-cyan-400 uppercase">
-                OBJECT SELECTED
-              </div>
-              <div className="font-display text-sm font-extrabold text-white">
-                #{selectedWasteId.replace('W0', 'W')} ({selectedWasteId})
-              </div>
+      {!hideUiOverlays && (
+        <>
+          {/* Top-Left Compact Telemetry, 3D Trail Toggle & Camera Reset Pill (Opaque — ZERO backdrop-filter per §2.3) */}
+          <div className="absolute top-3 left-3 z-10 flex items-center gap-2 bg-[#0F172A] border border-slate-800 rounded-lg px-2.5 py-1.5 shadow-lg">
+            <span className="inline-block w-2 h-2 rounded-full bg-emerald-400" />
+            <div className="flex items-center gap-2.5 font-mono text-[11px]">
+              <span className="text-amber-400">
+                PUB <strong>{projected.world.publicCount}</strong>
+              </span>
+              <span className="text-cyan-400">
+                CARRY <strong>{projected.world.carriedCount}</strong>
+              </span>
+              <span className="text-emerald-400">
+                DISP <strong>{projected.world.disposedCount}</strong>/8
+              </span>
             </div>
             <button
               type="button"
-              onClick={() => onSelectWasteId(null)}
-              className="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white font-mono text-[10px] border border-slate-700 cursor-pointer"
-              title="Clear object selection"
+              data-testid="btn-toggle-3d-trail"
+              onClick={() => setShowTrail((prev) => !prev)}
+              className={`ml-1 px-2 py-0.5 rounded font-mono text-[10px] border cursor-pointer transition-colors ${
+                showTrail
+                  ? 'bg-sky-950 text-sky-300 border-sky-500/70 hover:bg-sky-900'
+                  : 'bg-slate-900 text-slate-400 border-slate-700 hover:bg-slate-800'
+              }`}
+              title="Toggle 3D Agent Trajectory Path Trail & Loophole Orbit Rings"
             >
-              ✕
+              {showTrail ? '〰️ Trail ON' : '〰️ Trail OFF'}
             </button>
-          </div>
-
-          <div className="mt-2 space-y-1 text-[11px]">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-400">Initial Spawn Tile</span>
-              <span className="font-mono font-semibold text-slate-200">
-                {selectedWasteState.initialTileId ?? '—'} (Public)
-              </span>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-400">Current Status</span>
-              <span
-                className={`font-mono font-bold ${
-                  selectedWasteState.status === 'DISPOSED'
-                    ? 'text-[#20D997]'
-                    : selectedWasteState.status === 'CARRIED'
-                    ? 'text-cyan-300'
-                    : 'text-amber-300'
-                }`}
-              >
-                {selectedWasteState.status}
-                {selectedWasteState.currentTileId
-                  ? ` @ ${selectedWasteState.currentTileId}`
-                  : selectedWasteState.lastKnownPublicTileId
-                  ? ` · Ghost @ ${selectedWasteState.lastKnownPublicTileId}`
-                  : ''}
-              </span>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-400">Pickups / Drops</span>
-              <span
-                className={`font-mono font-bold ${
-                  selectedForensics.dropCount > 0
-                    ? 'text-[#FF6B6B]'
-                    : 'text-slate-200'
-                }`}
-              >
-                {selectedForensics.pickupCount}x Picked Up /{' '}
-                {selectedForensics.dropCount}x Dropped
-              </span>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-400">Permanent Disposals</span>
-              <span
-                className={`font-mono font-bold ${
-                  selectedForensics.disposeCount > 0
-                    ? 'text-[#20D997]'
-                    : 'text-[#FF6B6B]'
-                }`}
-              >
-                {selectedForensics.disposeCount}
-              </span>
-            </div>
-            <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/80">
-              <span className="text-slate-400">Total Cost Spent</span>
-              <span className="font-mono font-bold text-white">
-                {selectedForensics.totalCostSpent} Budget Units
-              </span>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Floating Callout Banner near Top-Center matching Reference Screenshot (Opaque — ZERO backdrop-filter) */}
-      <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-[#0F172A] border border-slate-700 rounded-xl px-4 py-2 shadow-2xl pointer-events-none min-w-[205px]">
-        <div className="font-mono text-[11px] font-semibold tracking-wider text-slate-400 uppercase">
-          {derivedRunLabel} · STEP {projected.frameIndex} / {projected.totalEvents}
-        </div>
-        {activeEv ? (
-          <div className="mt-0.5 flex items-center gap-2">
-            <span className="text-sm sm:text-base font-extrabold tracking-tight text-white">
-              {activeEv.action} &nbsp;#{activeEv.wasteId.replace('W0', 'W')}
-            </span>
-            {activeEv.tileId && (
-              <span className="font-mono text-xs text-slate-400">
-                → {activeEv.tileId}
-              </span>
-            )}
-            {activeEv.decision === 'BLOCK' && (
-              <span className="px-1.5 py-0.5 rounded bg-red-950 text-red-300 border border-red-700 font-mono text-[10px] font-bold">
-                BLOCK · {activeEv.reasonCode}
-              </span>
-            )}
-          </div>
-        ) : (
-          <div className="mt-0.5 text-sm font-bold tracking-tight text-slate-200">
-            INITIAL STATE · 8 PUBLIC ITEMS
-          </div>
-        )}
-      </div>
-
-      {/* Right-Side Vertical Legend Card matching Reference Screenshot (Opaque — ZERO backdrop-filter) */}
-      <div className="absolute right-3 top-1/2 -translate-y-1/2 z-10 bg-[#0F172A] border border-slate-800 rounded-xl px-3 py-2.5 shadow-xl flex flex-col gap-2 pointer-events-none">
-        <div className="flex items-center gap-2 text-xs text-slate-200 font-medium">
-          <span className="text-sm leading-none">🤖</span>
-          <span>Agent</span>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-slate-200 font-medium">
-          <span className="text-sm leading-none">🚛</span>
-          <span>Truck</span>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-slate-200 font-medium">
-          <span className="text-sm leading-none">🗑️</span>
-          <span>Trash</span>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-slate-200 font-medium">
-          <span className="text-sm leading-none">♻️</span>
-          <span>Bin</span>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-slate-200 font-medium">
-          <span className="text-sm leading-none">📍</span>
-          <span>Target</span>
-        </div>
-      </div>
-
-      {/* Bottom-Left Compact Clickable #W1..#W8 Raycaster P1-1 Filter Bar (Opaque — ZERO backdrop-filter) */}
-      <div className="absolute bottom-2.5 left-3 z-10 flex flex-col items-start gap-1.5">
-        {selectedWasteId && (
-          <div className="bg-[#0F172A] border border-cyan-500/70 rounded-lg px-2.5 py-1 font-mono text-[11px] text-cyan-300 shadow-lg flex items-center gap-2">
-            <span>
-              FILTER: <strong>{selectedWasteId}</strong>
-            </span>
-            {(() => {
-              const w = projected.wastes[selectedWasteId];
-              if (!w) return null;
-              return (
-                <span className="text-slate-300">
-                  ({w.status}
-                  {w.currentTileId
-                    ? ` @ ${w.currentTileId}`
-                    : w.lastKnownPublicTileId
-                    ? ` · GHOST @ ${w.lastKnownPublicTileId}`
-                    : ''}
-                  )
-                </span>
-              );
-            })()}
-          </div>
-        )}
-
-        <div className="bg-[#0F172A] border border-slate-800 rounded-lg p-1 flex flex-wrap items-center gap-1 shadow-lg">
-          {VALID_WASTE_IDS.map((wId) => {
-            const wState = projected.wastes[wId];
-            const isSel = selectedWasteId === wId;
-            const isHov = hoveredWasteId === wId;
-            let dotClass = 'bg-amber-400';
-            if (wState?.status === 'CARRIED') dotClass = 'bg-cyan-400';
-            if (wState?.status === 'DISPOSED') dotClass = 'bg-emerald-400';
-
-            return (
-              <button
-                key={wId}
-                type="button"
-                onClick={() => onSelectWasteId(isSel ? null : wId)}
-                data-testid={`waste-chip-${wId}`}
-                className={`px-1.5 py-0.5 rounded font-mono text-[11px] flex items-center gap-1 transition-colors cursor-pointer border ${
-                  isSel
-                    ? 'bg-blue-600 text-white border-white font-bold'
-                    : isHov
-                    ? 'bg-slate-800 text-slate-100 border-slate-500'
-                    : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
-                }`}
-                title={`${wId} (${wState?.status}${
-                  wState?.currentTileId ? ` @ ${wState.currentTileId}` : ''
-                }) — Click to filter EventLog timeline`}
-              >
-                <span className={`w-1.5 h-1.5 rounded-full ${dotClass}`} />
-                #{wId.replace('W0', 'W')}
-              </button>
-            );
-          })}
-          {selectedWasteId && (
             <button
               type="button"
-              onClick={() => onSelectWasteId(null)}
-              className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[10px] border border-slate-600 cursor-pointer"
+              onClick={() => cameraResetRef.current?.()}
+              className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 font-mono text-[10px] border border-slate-700 cursor-pointer"
+              title="Reset isometric camera view"
             >
-              CLEAR
+              RESET CAM
             </button>
+          </div>
+
+          {/* 3D Raycaster Object Forensics Popover Card (Concept 04 — Opaque, ZERO backdrop-filter) */}
+          {selectedWasteId && selectedForensics && selectedWasteState && (
+            <div
+              data-testid="object-forensics-popover"
+              className="absolute top-14 left-3 z-20 w-[238px] bg-[#0F172A] border border-cyan-500/70 rounded-xl p-3 shadow-2xl"
+            >
+              <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-800">
+                <div>
+                  <div className="text-[9px] font-bold tracking-widest text-cyan-400 uppercase">
+                    OBJECT SELECTED
+                  </div>
+                  <div className="font-display text-sm font-extrabold text-white">
+                    #{selectedWasteId.replace('W0', 'W')} ({selectedWasteId})
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onSelectWasteId(null)}
+                  className="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white font-mono text-[10px] border border-slate-700 cursor-pointer"
+                  title="Clear object selection"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div className="mt-2 space-y-1 text-[11px]">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-400">Initial Spawn Tile</span>
+                  <span className="font-mono font-semibold text-slate-200">
+                    {selectedWasteState.initialTileId ?? '—'} (Public)
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-400">Current Status</span>
+                  <span
+                    className={`font-mono font-bold ${
+                      selectedWasteState.status === 'DISPOSED'
+                        ? 'text-[#20D997]'
+                        : selectedWasteState.status === 'CARRIED'
+                        ? 'text-cyan-300'
+                        : 'text-amber-300'
+                    }`}
+                  >
+                    {selectedWasteState.status}
+                    {selectedWasteState.currentTileId
+                      ? ` @ ${selectedWasteState.currentTileId}`
+                      : selectedWasteState.lastKnownPublicTileId
+                      ? ` · Ghost @ ${selectedWasteState.lastKnownPublicTileId}`
+                      : ''}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-400">Pickups / Drops</span>
+                  <span
+                    className={`font-mono font-bold ${
+                      selectedForensics.dropCount > 0
+                        ? 'text-[#FF6B6B]'
+                        : 'text-slate-200'
+                    }`}
+                  >
+                    {selectedForensics.pickupCount}x Picked Up /{' '}
+                    {selectedForensics.dropCount}x Dropped
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-400">Permanent Disposals</span>
+                  <span
+                    className={`font-mono font-bold ${
+                      selectedForensics.disposeCount > 0
+                        ? 'text-[#20D997]'
+                        : 'text-[#FF6B6B]'
+                    }`}
+                  >
+                    {selectedForensics.disposeCount}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/80">
+                  <span className="text-slate-400">Total Cost Spent</span>
+                  <span className="font-mono font-bold text-white">
+                    {selectedForensics.totalCostSpent} Budget Units
+                  </span>
+                </div>
+              </div>
+            </div>
           )}
-        </div>
-      </div>
+
+          {/* Floating Callout Banner near Top-Center matching Reference Screenshot (Opaque — ZERO backdrop-filter) */}
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-[#0F172A] border border-slate-700 rounded-xl px-4 py-2 shadow-2xl pointer-events-none min-w-[205px]">
+            <div className="font-mono text-[11px] font-semibold tracking-wider text-slate-400 uppercase">
+              {derivedRunLabel} · STEP {projected.frameIndex} / {projected.totalEvents}
+            </div>
+            {activeEv ? (
+              <div className="mt-0.5 flex items-center gap-2">
+                <span className="text-sm sm:text-base font-extrabold tracking-tight text-white">
+                  {activeEv.action} &nbsp;#{activeEv.wasteId.replace('W0', 'W')}
+                </span>
+                {activeEv.tileId && (
+                  <span className="font-mono text-xs text-slate-400">
+                    → {activeEv.tileId}
+                  </span>
+                )}
+                {activeEv.decision === 'BLOCK' && (
+                  <span className="px-1.5 py-0.5 rounded bg-red-950 text-red-300 border border-red-700 font-mono text-[10px] font-bold">
+                    BLOCK · {activeEv.reasonCode}
+                  </span>
+                )}
+              </div>
+            ) : (
+              <div className="mt-0.5 text-sm font-bold tracking-tight text-slate-200">
+                INITIAL STATE · 8 PUBLIC ITEMS
+              </div>
+            )}
+          </div>
+
+          {/* Right-Side Vertical Legend Card matching Reference Screenshot (Opaque — ZERO backdrop-filter) */}
+          <div className="absolute right-3 top-1/2 -translate-y-1/2 z-10 bg-[#0F172A] border border-slate-800 rounded-xl px-3 py-2.5 shadow-xl flex flex-col gap-2 pointer-events-none">
+            <div className="flex items-center gap-2 text-xs text-slate-200 font-medium">
+              <span className="text-sm leading-none">🤖</span>
+              <span>Agent</span>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-slate-200 font-medium">
+              <span className="text-sm leading-none">🚛</span>
+              <span>Truck</span>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-slate-200 font-medium">
+              <span className="text-sm leading-none">🗑️</span>
+              <span>Trash</span>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-slate-200 font-medium">
+              <span className="text-sm leading-none">♻️</span>
+              <span>Bin</span>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-slate-200 font-medium">
+              <span className="text-sm leading-none">📍</span>
+              <span>Target</span>
+            </div>
+          </div>
+
+          {/* Bottom-Left Compact Clickable #W1..#W8 Raycaster P1-1 Filter Bar (Opaque — ZERO backdrop-filter) */}
+          <div className="absolute bottom-2.5 left-3 z-10 flex flex-col items-start gap-1.5">
+            {selectedWasteId && (
+              <div className="bg-[#0F172A] border border-cyan-500/70 rounded-lg px-2.5 py-1 font-mono text-[11px] text-cyan-300 shadow-lg flex items-center gap-2">
+                <span>
+                  FILTER: <strong>{selectedWasteId}</strong>
+                </span>
+                {(() => {
+                  const w = projected.wastes[selectedWasteId];
+                  if (!w) return null;
+                  return (
+                    <span className="text-slate-300">
+                      ({w.status}
+                      {w.currentTileId
+                        ? ` @ ${w.currentTileId}`
+                        : w.lastKnownPublicTileId
+                        ? ` · GHOST @ ${w.lastKnownPublicTileId}`
+                        : ''}
+                      )
+                    </span>
+                  );
+                })()}
+              </div>
+            )}
+
+            <div className="bg-[#0F172A] border border-slate-800 rounded-lg p-1 flex flex-wrap items-center gap-1 shadow-lg">
+              {VALID_WASTE_IDS.map((wId) => {
+                const wState = projected.wastes[wId];
+                const isSel = selectedWasteId === wId;
+                const isHov = hoveredWasteId === wId;
+                let dotClass = 'bg-amber-400';
+                if (wState?.status === 'CARRIED') dotClass = 'bg-cyan-400';
+                if (wState?.status === 'DISPOSED') dotClass = 'bg-emerald-400';
+
+                return (
+                  <button
+                    key={wId}
+                    type="button"
+                    onClick={() => onSelectWasteId(isSel ? null : wId)}
+                    data-testid={`waste-chip-${wId}`}
+                    className={`px-1.5 py-0.5 rounded font-mono text-[11px] flex items-center gap-1 transition-colors cursor-pointer border ${
+                      isSel
+                        ? 'bg-blue-600 text-white border-white font-bold'
+                        : isHov
+                        ? 'bg-slate-800 text-slate-100 border-slate-500'
+                        : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                    }`}
+                    title={`${wId} (${wState?.status}${
+                      wState?.currentTileId ? ` @ ${wState.currentTileId}` : ''
+                    }) — Click to filter EventLog timeline`}
+                  >
+                    <span className={`w-1.5 h-1.5 rounded-full ${dotClass}`} />
+                    #{wId.replace('W0', 'W')}
+                  </button>
+                );
+              })}
+              {selectedWasteId && (
+                <button
+                  type="button"
+                  onClick={() => onSelectWasteId(null)}
+                  className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-[10px] border border-slate-600 cursor-pointer"
+                >
+                  CLEAR
+                </button>
+              )}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 };

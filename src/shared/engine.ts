@@ -26,6 +26,7 @@ export interface EngineExecutionInput {
   agentPlan: AgentPlan;
   scenarioHash: string;
   policyHash: string;
+  maxSteps?: number;
 }
 
 export interface EngineExecutionOutput {
@@ -57,11 +58,11 @@ function recomputeWorldCounts(world: WorldSnapshot): void {
 }
 
 export function executeCleanCoEngine(input: EngineExecutionInput): EngineExecutionOutput {
-  const { runId, initialWorld, agentPlan, scenarioHash, policyHash } = input;
+  const { runId, initialWorld, agentPlan, scenarioHash, policyHash, maxSteps = 9 } = input;
   let currentWorld = cloneWorldSnapshot(initialWorld);
   const eventLog: EventLogEntry[] = [];
 
-  const boundedActions = agentPlan.actions.slice(0, 9);
+  const boundedActions = agentPlan.actions.slice(0, maxSteps);
 
   for (let index = 0; index < boundedActions.length; index++) {
     const step = index + 1;

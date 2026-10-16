@@ -4,7 +4,10 @@
  */
 
 import express from 'express';
-import { CANONICAL_FIXTURES, getDefaultFixtureForKpi } from '../shared/fixtures';
+import {
+  buildDynamicFixtureForKpiConfig,
+  CANONICAL_FIXTURES,
+} from '../shared/fixtures';
 import { buildVerifiedRunReport } from '../shared/runHarness';
 import {
   EVALUATOR_VERSION,
@@ -21,6 +24,7 @@ import type {
   RunErrorDetail,
   RunReport,
 } from '../shared/types';
+import { compileNaturalLanguageKpi, synthesizeGeminiSpeech } from './aiExtras';
 import { generateLiveGeminiPlan, PlannerExecutionError } from './geminiPlanner';
 
 const volatileRunCache = new Map<string, RunReport>();
@@ -117,9 +121,22 @@ export function createApiRouter(): express.Router {
 
     const kpiIdRaw = typeof body.kpiId === 'string' ? body.kpiId : '';
     const targetRaw = typeof body.target === 'number' ? body.target : Number(body.target);
+    const maxStepsRaw =
+      body.maxSteps !== undefined && body.maxSteps !== null
+        ? Number(body.maxSteps)
+        : undefined;
+    const maxActionCostRaw =
+      body.maxActionCost !== undefined && body.maxActionCost !== null
+        ? Number(body.maxActionCost)
+        : undefined;
 
     // 1. 422 Feasibility Gate (Executed BEFORE any model API call per AT-11)
-    const feasibility = validateKpiTargetFeasibility(kpiIdRaw, targetRaw);
+    const feasibility = validateKpiTargetFeasibility(
+      kpiIdRaw,
+      targetRaw,
+      maxStepsRaw,
+      maxActionCostRaw
+    );
     if (!feasibility.valid) {
       const errorDetail: RunErrorDetail = {
         code: 'IMPOSSIBLE_TARGET',
@@ -134,6 +151,7 @@ export function createApiRouter(): express.Router {
     }
 
     const { kpiConfig } = feasibility;
+    const effectiveMaxSteps = kpiConfig.maxSteps ?? 9;
     const requestedMode: ProvenanceType =
       body.mode === 'TEST_FIXTURE' ? 'TEST_FIXTURE' : 'LIVE_GEMINI';
     const fixturePresetId =
@@ -146,11 +164,13 @@ export function createApiRouter(): express.Router {
     let resolvedModelVersion = 'UNKNOWN';
     let latencyMs = 0;
     let usedFixturePreset: FixturePresetId | undefined;
+    let plannerAttempts = 1;
+    let plannerRetryHistory: import('../shared/types').PlannerAttemptRecord[] | undefined;
 
     try {
       if (body.fixedPlanOverride !== undefined) {
         // Fixed-Plan Replay (§3 line 53, AT-02)
-        const schemaCheck = validateAgentPlanSchema(body.fixedPlanOverride);
+        const schemaCheck = validateAgentPlanSchema(body.fixedPlanOverride, effectiveMaxSteps);
         if (!schemaCheck.valid || !schemaCheck.plan) {
           throw new PlannerExecutionError({
             code: 'MODEL_ERROR',
@@ -165,9 +185,9 @@ export function createApiRouter(): express.Router {
         resolvedModelVersion =
           requestedMode === 'LIVE_GEMINI' ? 'FIXED_PLAN_REPLAY' : 'DETERMINISTIC_FIXTURE_V15.2';
       } else if (requestedMode === 'TEST_FIXTURE') {
-        const fixture = getDefaultFixtureForKpi(kpiConfig.kpiId, fixturePresetId);
+        const fixture = buildDynamicFixtureForKpiConfig(kpiConfig, fixturePresetId);
         usedFixturePreset = fixture.presetId;
-        const schemaCheck = validateAgentPlanSchema(fixture.plan);
+        const schemaCheck = validateAgentPlanSchema(fixture.plan, effectiveMaxSteps);
         if (!schemaCheck.valid || !schemaCheck.plan) {
           throw new PlannerExecutionError({
             code: 'MODEL_ERROR',
@@ -187,6 +207,8 @@ export function createApiRouter(): express.Router {
         agentPlan = liveResult.agentPlan;
         resolvedModelVersion = liveResult.resolvedModelVersion;
         latencyMs = liveResult.latencyMs;
+        plannerAttempts = liveResult.plannerAttempts;
+        plannerRetryHistory = liveResult.plannerRetryHistory;
       }
     } catch (err) {
       if (err instanceof PlannerExecutionError) {
@@ -221,6 +243,8 @@ export function createApiRouter(): express.Router {
       resolvedModelVersion,
       startedAt,
       latencyMs,
+      plannerAttempts,
+      plannerRetryHistory,
     });
 
     if (!runReport.inspector.integrityPass) {
@@ -240,6 +264,37 @@ export function createApiRouter(): express.Router {
 
     cacheRunReport(runReport);
     res.status(200).json(runReport);
+  });
+
+  // POST /api/tts (C-1: Inspector Audio Briefing via gemini-3.8-flash-lite-tts with fallback)
+  router.post('/api/tts', async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const text = typeof body.text === 'string' ? body.text : '';
+    const voice = typeof body.voice === 'string' ? body.voice : undefined;
+    const style = typeof body.style === 'string' ? body.style : undefined;
+    const result = await synthesizeGeminiSpeech({ text, voice, style });
+    res.status(200).json(result);
+  });
+
+  // POST /api/compile-kpi (C-2: Natural Language KPI Compiler & Loophole Risk Predictor)
+  router.post('/api/compile-kpi', async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const promptText =
+      typeof body.promptText === 'string'
+        ? body.promptText
+        : typeof body.prompt === 'string'
+          ? body.prompt
+          : '';
+    if (!promptText.trim()) {
+      res.status(400).json({
+        error: 'EMPTY_PROMPT',
+        message: 'Please provide a natural-language reward instruction in "promptText".',
+      });
+      return;
+    }
+    const mode = body.mode === 'TEST_FIXTURE' ? 'TEST_FIXTURE' : 'LIVE_GEMINI';
+    const compiled = await compileNaturalLanguageKpi({ promptText, mode });
+    res.status(200).json(compiled);
   });
 
   return router;

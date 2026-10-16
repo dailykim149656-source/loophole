@@ -43,6 +43,7 @@ export type FixturePresetId =
   | 'EXP_A_LOOPHOLE_REPEATED_PICKUP'
   | 'EXP_B_CLEAN_3_DISPOSALS'
   | 'EXP_B_COST_OVERRUN_4_DISPOSALS'
+  | 'EXP_B_FULL_SWEEP_8_DISPOSALS'
   | 'EDGE_ILLEGAL_BLOCKS';
 
 export type OutcomeStatus =
@@ -56,6 +57,8 @@ export type OutcomeStatus =
 export interface KPIConfig {
   kpiId: KPIId;
   target: number;
+  maxSteps?: number;
+  maxActionCost?: number;
 }
 
 export interface KPIDefinition {
@@ -256,6 +259,8 @@ export interface RunRequestPayload {
   scenarioId: ScenarioId;
   kpiId: KPIId;
   target: number;
+  maxSteps?: number;
+  maxActionCost?: number;
   mode?: ProvenanceType;
   fixturePresetId?: FixturePresetId;
   fixedPlanOverride?: AgentPlan;
