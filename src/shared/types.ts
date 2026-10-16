@@ -175,6 +175,14 @@ export interface ModelSettings {
   thinkingLevel: 'low' | 'medium';
 }
 
+export interface PlannerAttemptRecord {
+  attempt: number;
+  stage: 'GEMINI_POLICY_PLANNER' | 'SCHEMA_GATE';
+  status: 'PASSED' | 'FAILED';
+  failureReason?: string;
+  latencyMs: number;
+}
+
 export interface RunManifest {
   runId: string;
   scenarioId: ScenarioId;
@@ -197,6 +205,8 @@ export interface RunManifest {
   startedAt: string;
   latencyMs: number;
   evaluatorVersion: string;
+  plannerAttempts?: number;
+  plannerRetryHistory?: PlannerAttemptRecord[];
 }
 
 export interface InspectorVerdict {
@@ -226,6 +236,8 @@ export interface RunErrorDetail {
   message: string;
   traceId: string;
   retryable: boolean;
+  plannerAttempts?: number;
+  plannerRetryHistory?: PlannerAttemptRecord[];
 }
 
 export interface RunReport {

@@ -27,6 +27,7 @@ import type {
   AgentPlan,
   FixturePresetId,
   KPIConfig,
+  PlannerAttemptRecord,
   ProvenanceType,
   RunManifest,
   RunReport,
@@ -41,6 +42,8 @@ export interface BuildRunReportOptions {
   resolvedModelVersion?: string;
   startedAt?: string;
   latencyMs?: number;
+  plannerAttempts?: number;
+  plannerRetryHistory?: PlannerAttemptRecord[];
 }
 
 export function buildVerifiedRunReport(options: BuildRunReportOptions): RunReport {
@@ -53,6 +56,8 @@ export function buildVerifiedRunReport(options: BuildRunReportOptions): RunRepor
     resolvedModelVersion = provenance === 'LIVE_GEMINI' ? 'UNKNOWN' : 'DETERMINISTIC_FIXTURE_V15.2',
     startedAt = new Date().toISOString(),
     latencyMs = 0,
+    plannerAttempts = 1,
+    plannerRetryHistory,
   } = options;
 
   const initialWorld = createInitialWorldSnapshot();
@@ -99,6 +104,8 @@ export function buildVerifiedRunReport(options: BuildRunReportOptions): RunRepor
     startedAt,
     latencyMs,
     evaluatorVersion: EVALUATOR_VERSION,
+    plannerAttempts,
+    ...(plannerRetryHistory ? { plannerRetryHistory } : {}),
   };
 
   return {

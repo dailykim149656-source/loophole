@@ -27,6 +27,25 @@ export interface WasteVisualProjection {
   isActiveEventTarget: boolean;
 }
 
+export interface TrajectorySegment {
+  step: number;
+  eventId: string;
+  action: EventLogEntry['action'];
+  wasteId: WasteId;
+  fromLocation: TileId | 'DISPOSAL_BIN' | 'HOME_PAD';
+  toLocation: TileId | 'DISPOSAL_BIN' | 'HOME_PAD';
+  decision: EventLogEntry['decision'];
+}
+
+export interface WasteForensicsSummary {
+  wasteId: WasteId;
+  pickupCount: number;
+  dropCount: number;
+  disposeCount: number;
+  blockedCount: number;
+  totalCostSpent: number;
+}
+
 export interface ProjectedFrameState {
   runId: string;
   frameIndex: number;
@@ -45,6 +64,8 @@ export interface ProjectedFrameState {
     blockedAttempts: number;
   };
   wastes: Record<WasteId, WasteVisualProjection>;
+  trajectoryHistory: TrajectorySegment[];
+  wasteForensics: Record<WasteId, WasteForensicsSummary>;
 }
 
 export function getWorldSnapshotAtFrame(
@@ -67,11 +88,39 @@ export function getWorldSnapshotAtFrame(
   const lastKnownTile: Record<WasteId, TileId> = {} as Record<WasteId, TileId>;
   const lastAcceptedEvent: Record<WasteId, string | null> = {} as Record<WasteId, string | null>;
   const pickupCountByWaste: Record<WasteId, number> = {} as Record<WasteId, number>;
+  const wasteForensics: Record<WasteId, WasteForensicsSummary> = {} as Record<
+    WasteId,
+    WasteForensicsSummary
+  >;
 
   for (const id of VALID_WASTE_IDS) {
     lastKnownTile[id] = initialWorld.wastes[id].initialTileId;
     lastAcceptedEvent[id] = null;
     pickupCountByWaste[id] = 0;
+    wasteForensics[id] = {
+      wasteId: id,
+      pickupCount: 0,
+      dropCount: 0,
+      disposeCount: 0,
+      blockedCount: 0,
+      totalCostSpent: 0,
+    };
+  }
+
+  // Compute full-run per-item forensics across eventLog (up to totalEvents)
+  for (const ev of eventLog) {
+    if ((VALID_WASTE_IDS as string[]).includes(ev.wasteId)) {
+      const wId = ev.wasteId as WasteId;
+      const itemStat = wasteForensics[wId];
+      if (ev.decision === 'ACCEPT') {
+        itemStat.totalCostSpent += ev.actionCost;
+        if (ev.action === 'PICK_UP') itemStat.pickupCount += 1;
+        else if (ev.action === 'DROP') itemStat.dropCount += 1;
+        else if (ev.action === 'DISPOSE') itemStat.disposeCount += 1;
+      } else {
+        itemStat.blockedCount += 1;
+      }
+    }
   }
 
   let acceptedPickups = 0;
@@ -80,10 +129,13 @@ export function getWorldSnapshotAtFrame(
   let totalActionCost = 0;
   let blockedAttempts = 0;
   let workerTargetLocation: TileId | 'DISPOSAL_BIN' | 'HOME_PAD' = 'HOME_PAD';
+  const trajectoryHistory: TrajectorySegment[] = [];
 
   for (let i = 0; i < clampedFrame; i++) {
     const ev = eventLog[i];
     const isKnownWaste = (VALID_WASTE_IDS as string[]).includes(ev.wasteId);
+    const prevLocation = workerTargetLocation;
+
     if (ev.decision === 'ACCEPT' && isKnownWaste) {
       const wId = ev.wasteId as WasteId;
       lastAcceptedEvent[wId] = ev.eventId;
@@ -108,10 +160,28 @@ export function getWorldSnapshotAtFrame(
         disposedSet.add(wId);
         workerTargetLocation = 'DISPOSAL_BIN';
       }
+
+      trajectoryHistory.push({
+        step: ev.step,
+        eventId: ev.eventId,
+        action: ev.action,
+        wasteId: wId,
+        fromLocation: prevLocation,
+        toLocation: workerTargetLocation,
+        decision: ev.decision,
+      });
     } else {
       blockedAttempts += 1;
-      if (ev.tileId && ev.tileId.startsWith('T')) {
-        // Keep worker position unchanged on BLOCK (scene state invariant per AT-17)
+      if (isKnownWaste) {
+        trajectoryHistory.push({
+          step: ev.step,
+          eventId: ev.eventId,
+          action: ev.action,
+          wasteId: ev.wasteId as WasteId,
+          fromLocation: prevLocation,
+          toLocation: prevLocation,
+          decision: 'BLOCK',
+        });
       }
     }
   }
@@ -173,6 +243,8 @@ export function getWorldSnapshotAtFrame(
       blockedAttempts,
     },
     wastes,
+    trajectoryHistory,
+    wasteForensics,
   };
 }
 
